@@ -1,0 +1,25 @@
+name: Huobi Daily Balance Report
+
+on:
+  schedule:
+    - cron: "0 2,10 * * *"
+  workflow_dispatch:
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Send WeCom report
+        env:
+          HUOBI_KEYS_JSON: ${{ secrets.HUOBI_KEYS_JSON }}
+          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
+        run: python3 huobi_wecom_valuation_report.py
