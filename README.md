@@ -1,8 +1,9 @@
 # Huobi Daily Balance Report
 
-查询 HTX/Huobi U 本位合约账户总资产，并通过企业微信机器人 Webhook 发送报告。
+查询 HTX/Huobi U 本位合约账户总资产和开单/持仓情况，并通过企业微信机器人 Webhook 发送报告。
 
 报告取的是 U 本位合约接口 `source=valuation` 对应的 `balance`，即账户总资产估值。
+开单情况取当前 U 本位合约持仓，包含合约、方向、张数、持仓均价、最新价和未实现盈亏。
 
 ## 本地运行
 
@@ -33,4 +34,3 @@ python3 huobi_wecom_valuation_report.py --no 520 --dry-run
 ## 定时任务
 
 GitHub Actions 使用 UTC cron。北京时间是 UTC+8，所以每天北京时间 10:00 和 18:00 对应 UTC 02:00 和 10:00。
-

@@ -29,11 +29,14 @@ from huobi_query_balances import (
     get_swap_valuation,
     load_api_keys,
     select_keys,
+    signed_post,
+    to_decimal,
 )
 
 
 DEFAULT_WEBHOOK_ENV = "WECOM_WEBHOOK_URL"
 FALLBACK_WEBHOOK_ENV = "WECHAT_WORK_WEBHOOK_URL"
+MAX_WECOM_MARKDOWN_BYTES = 3500
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +67,28 @@ def parse_args() -> argparse.Namespace:
         "--valuation-asset",
         default="USDT",
         help="Valuation asset to request. Default: USDT",
+    )
+    parser.add_argument(
+        "--position-margin-mode",
+        choices=["cross", "isolated", "all"],
+        default="all",
+        help="U-margined swap position margin mode to query. Default: all",
+    )
+    parser.add_argument(
+        "--position-margin-account",
+        default="USDT",
+        help="U-margined cross position margin account. Default: USDT",
+    )
+    parser.add_argument(
+        "--max-position-lines",
+        type=int,
+        default=80,
+        help="Maximum position detail lines shown in the WeCom message. Default: 80",
+    )
+    parser.add_argument(
+        "--no-positions",
+        action="store_true",
+        help="Do not query or report open positions.",
     )
     parser.add_argument(
         "--no",
@@ -150,25 +175,29 @@ def first_present(item: dict[str, Any], *names: str) -> Any:
     return None
 
 
-def query_valuation_rows(args: argparse.Namespace, keys: Iterable[ApiKey]) -> tuple[list[dict[str, str]], list[str]]:
+def query_report_rows(
+    args: argparse.Namespace,
+    keys: Iterable[ApiKey],
+) -> tuple[list[dict[str, str]], list[dict[str, str]], list[str]]:
     selector_args = SimpleNamespace(no=args.no, limit=args.limit)
     selected_keys = select_keys(selector_args, keys)
-    rows: list[dict[str, str]] = []
+    valuation_rows: list[dict[str, str]] = []
+    position_rows: list[dict[str, str]] = []
     errors: list[str] = []
 
     for offset, key in enumerate(selected_keys, start=1):
         prefix = f"no={key.no} uid={key.uid or '-'}"
-        print(f"[{offset}/{len(selected_keys)}] querying {prefix} valuation ...", file=sys.stderr)
+        print(f"[{offset}/{len(selected_keys)}] querying {prefix} valuation/positions ...", file=sys.stderr)
         try:
-            valuation_rows = get_swap_valuation(
+            api_valuation_rows = get_swap_valuation(
                 key,
                 host=args.swap_host,
                 valuation_asset=args.valuation_asset.upper(),
                 timeout=args.timeout,
                 retries=args.retries,
             )
-            for row in valuation_rows:
-                rows.append(
+            for row in api_valuation_rows:
+                valuation_rows.append(
                     {
                         "no": row.key_no,
                         "uid": row.uid,
@@ -178,20 +207,132 @@ def query_valuation_rows(args: argparse.Namespace, keys: Iterable[ApiKey]) -> tu
                     }
                 )
         except Exception as exc:
-            errors.append(f"{prefix}: {exc}")
+            errors.append(f"{prefix} valuation: {exc}")
+
+        if not args.no_positions:
+            try:
+                position_rows.extend(query_position_rows(args, key))
+            except Exception as exc:
+                errors.append(f"{prefix} positions: {exc}")
 
         if args.delay > 0 and offset < len(selected_keys):
             time.sleep(args.delay)
 
-    rows.sort(key=lambda row: int(row["no"]) if row["no"].isdigit() else row["no"])
-    return rows, errors
+    valuation_rows.sort(key=row_no_sort_key)
+    position_rows.sort(key=lambda row: (row_no_sort_key(row), row["contract"], row["direction"]))
+    return valuation_rows, position_rows, errors
+
+
+def query_position_rows(args: argparse.Namespace, key: ApiKey) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    if args.position_margin_mode in {"cross", "all"}:
+        rows.extend(
+            get_swap_position_rows(
+                key,
+                host=args.swap_host,
+                path="/linear-swap-api/v1/swap_cross_position_info",
+                body={"margin_account": args.position_margin_account},
+                source="cross_position",
+                timeout=args.timeout,
+                retries=args.retries,
+            )
+        )
+    if args.position_margin_mode in {"isolated", "all"}:
+        rows.extend(
+            get_swap_position_rows(
+                key,
+                host=args.swap_host,
+                path="/linear-swap-api/v1/swap_position_info",
+                body={},
+                source="isolated_position",
+                timeout=args.timeout,
+                retries=args.retries,
+            )
+        )
+    return rows
+
+
+def get_swap_position_rows(
+    key: ApiKey,
+    *,
+    host: str,
+    path: str,
+    body: dict[str, Any],
+    source: str,
+    timeout: float,
+    retries: int,
+) -> list[dict[str, str]]:
+    response = signed_post(
+        host=host,
+        path=path,
+        access_key=key.access_key,
+        secret_key=key.secret_key,
+        body=body,
+        timeout=timeout,
+        retries=retries,
+    )
+    data = response.get("data", [])
+    if not isinstance(data, list):
+        raise RuntimeError(f"Unexpected position response: {response}")
+
+    rows: list[dict[str, str]] = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        volume = to_decimal(item.get("volume", "0"))
+        available = to_decimal(item.get("available", "0"))
+        frozen = to_decimal(item.get("frozen", "0"))
+        if volume == 0 and available == 0 and frozen == 0:
+            continue
+        rows.append(
+            {
+                "no": key.no,
+                "uid": key.uid,
+                "source": source,
+                "margin_mode": str(item.get("margin_mode", "")),
+                "contract": str(item.get("contract_code", "")),
+                "direction": translate_direction(str(item.get("direction", ""))),
+                "volume": format_position_decimal(volume),
+                "available": format_position_decimal(available),
+                "frozen": format_position_decimal(frozen),
+                "cost_open": format_position_decimal(to_decimal(item.get("cost_open", "0"))),
+                "cost_hold": format_position_decimal(to_decimal(item.get("cost_hold", "0"))),
+                "last_price": format_position_decimal(to_decimal(item.get("last_price", "0"))),
+                "profit_unreal": format_decimal(to_decimal(item.get("profit_unreal", "0"))),
+                "lever_rate": str(item.get("lever_rate", "")),
+            }
+        )
+    return rows
+
+
+def row_no_sort_key(row: dict[str, str]) -> int | str:
+    return int(row["no"]) if row["no"].isdigit() else row["no"]
+
+
+def translate_direction(direction: str) -> str:
+    mapping = {
+        "buy": "多",
+        "sell": "空",
+    }
+    return mapping.get(direction.lower(), direction)
 
 
 def format_decimal(value: Decimal) -> str:
     return format(value.quantize(Decimal("0.0001")), "f")
 
 
-def build_markdown(rows: list[dict[str, str]], errors: list[str], valuation_asset: str) -> str:
+def format_position_decimal(value: Decimal) -> str:
+    normalized = value.normalize()
+    return format(normalized, "f") if value else "0"
+
+
+def build_markdown(
+    rows: list[dict[str, str]],
+    position_rows: list[dict[str, str]],
+    errors: list[str],
+    valuation_asset: str,
+    max_position_lines: int,
+) -> str:
     now = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S %Z")
     title = f"HTX U本位合约账户总资产 ({valuation_asset.upper()})"
 
@@ -209,6 +350,26 @@ def build_markdown(rows: list[dict[str, str]], errors: list[str], valuation_asse
     else:
         lines.append("<font color=\"warning\">没有查询到账户总资产数据。</font>")
 
+    lines.append("")
+    lines.append("### 开单/持仓情况")
+    if position_rows:
+        total_unreal = sum(Decimal(row["profit_unreal"]) for row in position_rows)
+        position_accounts = sorted({row["no"] for row in position_rows}, key=lambda no: int(no) if no.isdigit() else no)
+        lines.append(f"持仓账号数：{len(position_accounts)}")
+        lines.append(f"持仓条数：{len(position_rows)}")
+        lines.append(f"未实现盈亏合计：<font color=\"info\">{format_decimal(total_unreal)} {valuation_asset.upper()}</font>")
+        lines.append("")
+        for row in position_rows[:max_position_lines]:
+            lines.append(
+                f"- no {row['no']} {row['contract']} {row['direction']} "
+                f"{row['volume']}张，均价 {row['cost_hold']}，最新 {row['last_price']}，"
+                f"浮盈亏 <font color=\"comment\">{row['profit_unreal']} {valuation_asset.upper()}</font>"
+            )
+        if len(position_rows) > max_position_lines:
+            lines.append(f"- 还有 {len(position_rows) - max_position_lines} 条持仓未展示")
+    else:
+        lines.append("当前没有查询到开单/持仓。")
+
     if errors:
         lines.append("")
         lines.append("异常：")
@@ -221,6 +382,34 @@ def build_markdown(rows: list[dict[str, str]], errors: list[str], valuation_asse
 
 
 def send_wecom_markdown(webhook_url: str, markdown: str, *, timeout: float, retries: int) -> None:
+    chunks = split_markdown(markdown)
+    for index, chunk in enumerate(chunks, start=1):
+        content = chunk
+        if len(chunks) > 1:
+            content = f"**Huobi 报告 {index}/{len(chunks)}**\n\n{chunk}"
+        send_wecom_markdown_chunk(webhook_url, content, timeout=timeout, retries=retries)
+
+
+def split_markdown(markdown: str) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+
+    for line in markdown.splitlines():
+        line_bytes = len((line + "\n").encode("utf-8"))
+        if current and current_bytes + line_bytes > MAX_WECOM_MARKDOWN_BYTES:
+            chunks.append("\n".join(current))
+            current = []
+            current_bytes = 0
+        current.append(line)
+        current_bytes += line_bytes
+
+    if current:
+        chunks.append("\n".join(current))
+    return chunks or [markdown]
+
+
+def send_wecom_markdown_chunk(webhook_url: str, markdown: str, *, timeout: float, retries: int) -> None:
     payload = json.dumps(
         {
             "msgtype": "markdown",
@@ -263,8 +452,14 @@ def main() -> int:
     args = parse_args()
     try:
         keys = load_keys_from_args(args)
-        rows, errors = query_valuation_rows(args, keys)
-        markdown = build_markdown(rows, errors, args.valuation_asset)
+        rows, position_rows, errors = query_report_rows(args, keys)
+        markdown = build_markdown(
+            rows,
+            position_rows,
+            errors,
+            args.valuation_asset,
+            args.max_position_lines,
+        )
         print(markdown)
 
         if not args.dry_run:
