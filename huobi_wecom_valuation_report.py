@@ -342,11 +342,11 @@ def build_markdown(
         lines.append(f"账户数：{len(rows)}")
         lines.append(f"合计：<font color=\"info\">{format_decimal(total)} {valuation_asset.upper()}</font>")
         lines.append("")
-        for row in rows:
-            lines.append(
-                f"- no {row['no']} / uid {row['uid']}: "
-                f"<font color=\"comment\">{row['balance']} {row['asset']}</font>"
-            )
+        # for row in rows:
+        #     lines.append(
+        #         f"- no {row['no']} / uid {row['uid']}: "
+        #         f"<font color=\"comment\">{row['balance']} {row['asset']}</font>"
+        #     )
     else:
         lines.append("<font color=\"warning\">没有查询到账户总资产数据。</font>")
 
