@@ -219,7 +219,14 @@ def query_report_rows(
             time.sleep(args.delay)
 
     valuation_rows.sort(key=row_no_sort_key)
-    position_rows.sort(key=lambda row: (row_no_sort_key(row), row["contract"], row["direction"]))
+    position_rows.sort(
+        key=lambda row: (
+            -Decimal(row["profit_unreal"]),
+            row_no_sort_key(row),
+            row["contract"],
+            row["direction"],
+        )
+    )
     return valuation_rows, position_rows, errors
 
 
